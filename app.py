@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import numpy as np
 import re
 import csv
+from pathlib import Path
 import yfinance as yf
 
 # --- PAGE CONFIGURATION ---
@@ -16,6 +17,13 @@ BENCHMARK_ORANGE = '#E67E22' # Benchmark Line
 DANGER_RED = '#E74C3C'       # Loss
 NEUTRAL_GREY = '#7F8C8D'     # Invested Line
 CATEGORY_COLORS = ['#F1C40F', '#95A5A6', '#3498DB', '#2ECC71', '#E67E22', '#9B59B6']
+PLOTLY_TEMPLATE = 'plotly_dark'
+
+# Registered account contribution room defaults (CAD)
+TFSA_CONTRIBUTION_LIMIT = 46_700
+FHSA_CONTRIBUTION_LIMIT = 24_000
+RRSP_CONTRIBUTION_LIMIT = 31_560
+FHSA_ANNUAL_LIMIT = 8_000
 
 # Context for benchmarks (Added Currency Info)
 BENCHMARK_CONTEXT = {
@@ -36,6 +44,8 @@ REAL_SP500_DATA = [
 ]
 FALLBACK_DATES = pd.date_range(start='2021-01-01', periods=len(REAL_SP500_DATA), freq='MS')
 FALLBACK_BENCH_MAP = dict(zip(FALLBACK_DATES, REAL_SP500_DATA))
+
+TEMPLATE_CSV_PATH = Path(__file__).parent / "stacked_template.csv"
 
 # --- 1. DATA PROCESSING FUNCTIONS ---
 
@@ -61,7 +71,8 @@ def get_benchmark_data(ticker_symbol, start_date):
             data.columns = data.columns.get_level_values(0)
         data = data[['Close']].dropna()
         data.index = data.index.to_period('M').to_timestamp()
-        return data['Close'].to_dict()
+        result = data['Close'].to_dict()
+        return result if result else FALLBACK_BENCH_MAP
     except Exception:
         return FALLBACK_BENCH_MAP
 
@@ -77,6 +88,17 @@ def parse_data(uploaded_files):
         except ValueError: return 0.0
 
     def classify_account(fund_name, bank_name):
+        exact = str(fund_name).strip().lower()
+        simple_types = {
+            'tfsa': 'TFSA',
+            'fhsa': 'FHSA',
+            'rrsp': 'RRSP',
+            'resp': 'RESP',
+            'non-registered': 'Non-Registered',
+        }
+        if exact in simple_types:
+            return simple_types[exact]
+
         text = (str(fund_name) + " " + str(bank_name)).lower()
         if any(k in text for k in ['first home', 'fhsa']): return 'FHSA'
         if any(k in text for k in ['education', 'resp']): return 'RESP'
@@ -100,22 +122,35 @@ def parse_data(uploaded_files):
                 market_value = 0.0
                 book_cost = 0.0
                 valid_row = False
+                bank_name = ""
+                fund_name = ""
                 if current_date:
-                    if len(row) >= 7: 
+                    if len(row) >= 7:
                         market_value = clean_money(row[6])
                         book_cost = clean_money(row[3])
+                        bank_name = row[1] if len(row) > 1 else ""
+                        fund_name = row[2] if len(row) > 2 else ""
                         valid_row = True
                     elif len(row) == 5:
                         market_value = clean_money(row[4])
                         book_cost = clean_money(row[3])
+                        bank_name = row[1] if len(row) > 1 else ""
+                        fund_name = row[2] if len(row) > 2 else ""
+                        valid_row = True
+                    elif len(row) == 4:
+                        market_value = clean_money(row[3])
+                        book_cost = clean_money(row[2])
+                        fund_name = row[1] if len(row) > 1 else ""
                         valid_row = True
 
                 if valid_row and market_value > 0:
-                    bank_name = row[1] if len(row) > 1 else ""
-                    fund_name = row[2] if len(row) > 2 else ""
                     if fund_name != "" and "Total" not in fund_name:
                         acct_type = classify_account(fund_name, bank_name)
-                        all_data.append({'Date': current_date, 'Type': acct_type, 'Value': market_value, 'BookCost': book_cost})
+                        all_data.append({
+                            'Date': current_date, 'Type': acct_type,
+                            'Bank': bank_name, 'FundName': fund_name,
+                            'Value': market_value, 'BookCost': book_cost
+                        })
         except Exception as e:
             st.error(f"Error reading {uploaded_file.name}: {e}")
 
@@ -125,32 +160,92 @@ def generate_example_data():
     dates = pd.date_range(start='2021-01-01', periods=len(REAL_SP500_DATA), freq='MS')
     all_records = []
     assets = [
-        {"Name": "TFSA (S&P 500)", "Monthly": 400, "Prices": REAL_SP500_DATA},
-        {"Name": "RRSP (Bonds)",   "Monthly": 300, "Prices": None, "Base": 100, "Growth": 0.003},
-        {"Name": "RESP (Education)","Monthly": 200, "Prices": None, "Base": 100, "Growth": 0.005},
-        {"Name": "Non-Reg (Tech)", "Monthly": 100, "Prices": None, "Base": 50,  "Growth": 0.012, "Vol": 0.08}
+        {"Type": "TFSA", "Monthly": 400, "Prices": REAL_SP500_DATA},
+        {"Type": "FHSA", "Monthly": 150, "Prices": None, "Base": 100, "Growth": 0.002},
+        {"Type": "RRSP", "Monthly": 300, "Prices": None, "Base": 100, "Growth": 0.003},
+        {"Type": "RESP", "Monthly": 200, "Prices": None, "Base": 100, "Growth": 0.005},
+        {"Type": "Non-Registered", "Monthly": 100, "Prices": None, "Base": 50, "Growth": 0.012, "Vol": 0.08}
     ]
-    units = {a["Name"]: 0.0 for a in assets}
-    prices = {a["Name"]: a.get("Base", 100) for a in assets}
+    units = {a["Type"]: 0.0 for a in assets}
+    prices = {a["Type"]: a.get("Base", 100) for a in assets}
 
     for i, date in enumerate(dates):
         for a in assets:
-            name = a["Name"]
+            acct_type = a["Type"]
             if a["Prices"]:
                 price = a["Prices"][i]
             else:
-                price = prices[name] * (1 + (np.random.normal(a["Growth"], a.get("Vol", 0))))
-                prices[name] = price
-            
-            units[name] += a["Monthly"] / price
+                price = prices[acct_type] * (1 + (np.random.normal(a["Growth"], a.get("Vol", 0))))
+                prices[acct_type] = price
+
+            units[acct_type] += a["Monthly"] / price
             all_records.append({
-                'Date': date, 
-                'Type': name, 
-                'Value': units[name] * price, 
+                'Date': date,
+                'Type': acct_type,
+                'Bank': 'Demo',
+                'FundName': acct_type,
+                'Value': units[acct_type] * price,
                 'BookCost': (i + 1) * a["Monthly"]
             })
-            
+
     return pd.DataFrame(all_records)
+
+
+def validate_import_data(df):
+    """Return import summary and data-quality warnings for uploaded CSV data."""
+    if df.empty:
+        return {'summary': None, 'warnings': []}
+
+    latest = df['Date'].max()
+    n_months = df['Date'].nunique()
+    fund_col = 'FundName' if 'FundName' in df.columns else 'Type'
+    latest_funds = df[df['Date'] == latest][fund_col].nunique()
+    summary = (
+        f"Latest snapshot: {latest.strftime('%b %Y')} · "
+        f"{latest_funds} accounts · {n_months} months loaded"
+    )
+    warnings = []
+
+    dupes = df.duplicated(subset=['Date', fund_col], keep=False)
+    if dupes.any():
+        warnings.append(
+            f"Duplicate rows for the same date and fund ({int(dupes.sum())} rows)."
+        )
+
+    dates = sorted(df['Date'].unique())
+    if len(dates) >= 2:
+        gap_msgs = []
+        for i in range(1, len(dates)):
+            prev, curr = pd.Timestamp(dates[i - 1]), pd.Timestamp(dates[i])
+            month_gap = (curr.year - prev.year) * 12 + (curr.month - prev.month)
+            if month_gap > 1:
+                gap_msgs.append(
+                    f"{prev.strftime('%b %Y')} → {curr.strftime('%b %Y')} "
+                    f"({month_gap - 1} mo gap)"
+                )
+        if gap_msgs:
+            extra = "..." if len(gap_msgs) > 3 else ""
+            warnings.append("Missing months: " + "; ".join(gap_msgs[:3]) + extra)
+
+    for fund, grp in df.groupby(fund_col):
+        by_date = grp.groupby('Date')['BookCost'].sum().sort_index()
+        if len(by_date) < 2:
+            continue
+        if (by_date.diff().dropna() < -0.01).any():
+            warnings.append(
+                f"Book Cost decreased for {fund} — may reflect a withdrawal or data change."
+            )
+
+    return {'summary': summary, 'warnings': warnings}
+
+
+def render_import_feedback(df):
+    """Show import summary and validation warnings."""
+    feedback = validate_import_data(df)
+    if feedback['summary']:
+        st.caption(feedback['summary'])
+    for msg in feedback['warnings']:
+        st.warning(msg)
 
 # --- 2. MONTE CARLO SIMULATOR ---
 
@@ -176,9 +271,362 @@ def run_monte_carlo(current_val, monthly_add, years, mean_ret_pct, vol_pct, num_
         
     return paths
 
+# --- CONTRIBUTION LIMIT HELPERS ---
+
+def get_contribution_usage(df, account_type):
+    """Sum BookCost for an account type at the latest snapshot (CAD source data)."""
+    if df.empty:
+        return 0.0
+    latest_date = df['Date'].max()
+    mask = (df['Date'] == latest_date) & (df['Type'] == account_type)
+    return df.loc[mask, 'BookCost'].sum()
+
+
+def get_ytd_contribution(df, account_type):
+    """Estimate calendar-year contributions from BookCost changes (CAD source data)."""
+    if df.empty:
+        return 0.0
+    latest_date = df['Date'].max()
+    current_year = latest_date.year
+    type_df = df[df['Type'] == account_type]
+    if type_df.empty:
+        return 0.0
+
+    in_year = type_df[type_df['Date'].dt.year == current_year]
+    if in_year.empty:
+        return 0.0
+
+    latest_snapshot = in_year[in_year['Date'] == in_year['Date'].max()]['BookCost'].sum()
+    prior = type_df[type_df['Date'].dt.year < current_year]
+    baseline = 0.0
+    if not prior.empty:
+        last_prior_date = prior['Date'].max()
+        baseline = prior[prior['Date'] == last_prior_date]['BookCost'].sum()
+
+    return max(latest_snapshot - baseline, 0.0)
+
+
+def avg_monthly_contribution(df, account_type):
+    """Average monthly BookCost increase for an account type."""
+    type_df = df[df['Type'] == account_type]
+    if type_df.empty:
+        return 0.0
+    by_date = type_df.groupby('Date')['BookCost'].sum().sort_index()
+    if len(by_date) < 2:
+        return 0.0
+    return by_date.diff().dropna().mean()
+
+
+def contribution_pct(used, limit):
+    """Return percentage of contribution limit used (uncapped for over-limit display)."""
+    return (used / limit * 100) if limit > 0 else 0.0
+
+
+def limit_bar_color(pct):
+    if pct > 100:
+        return DANGER_RED
+    if pct >= 90:
+        return BENCHMARK_ORANGE
+    return PRIMARY_GREEN
+
+
+LABEL_GREY = 'rgba(255, 255, 255, 0.45)'
+CRA_LIMIT_INFO = (
+    "<b>RRSP:</b> Your deduction limit is on your account dashboard.<br><br>"
+    "<b>TFSA:</b> Available room is listed here, but CRA updates it once a year. "
+    "Check from <b>April</b> for the previous year's records.<br><br>"
+    "<b>FHSA:</b> Deduction limits and participation room are in your CRA profile."
+)
+
+
+def render_cra_info_tooltip():
+    st.markdown(
+        f"""
+        <style>
+        section[data-testid="stSidebar"] {{
+            overflow-x: hidden !important;
+        }}
+        .cra-info-wrap {{
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .cra-info-btn {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 1.6rem;
+            height: 1.6rem;
+            border-radius: 50%;
+            border: 1px solid #7F8C8D;
+            color: #7F8C8D;
+            font-size: 0.8rem;
+            font-weight: 700;
+            font-style: italic;
+            font-family: Georgia, serif;
+            cursor: help;
+            user-select: none;
+            background: transparent;
+        }}
+        .cra-info-wrap .cra-info-tip {{
+            visibility: hidden;
+            opacity: 0;
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 8px);
+            width: 260px;
+            max-width: 85vw;
+            padding: 12px 14px;
+            border-radius: 8px;
+            background: #1e1e1e;
+            color: #fafafa;
+            font-size: 0.82rem;
+            line-height: 1.45;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+            border: 1px solid #333;
+            transition: opacity 0.15s ease;
+            z-index: 9999;
+            pointer-events: none;
+            text-align: left;
+        }}
+        .cra-info-wrap:hover .cra-info-tip {{
+            visibility: visible;
+            opacity: 1;
+        }}
+        </style>
+        <div class="cra-info-wrap">
+            <span class="cra-info-btn" title="CRA limit lookup tips">i</span>
+            <div class="cra-info-tip">{CRA_LIMIT_INFO}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+CRA_MY_ACCOUNT_URL = (
+    "https://www.canada.ca/en/revenue-agency/services/e-services/"
+    "digital-services-individuals/account-individuals.html"
+)
+ACCOUNT_FULL_NAMES = {
+    'TFSA': 'Tax-Free Savings Account',
+    'FHSA': 'First Home Savings Account',
+    'RRSP': 'Registered Retirement Savings Plan',
+}
+
+
+def render_account_gauge(pct):
+    """Semi-circular gauge for a single account's limit usage."""
+    color = limit_bar_color(pct)
+    fig = go.Figure(go.Indicator(
+        mode='gauge+number',
+        value=pct,
+        number={
+            'suffix': '% USED',
+            'font': {'size': 28, 'color': color},
+            'valueformat': '.1f',
+        },
+        gauge={
+            'shape': 'angular',
+            'axis': {
+                'range': [0, 100],
+                'tickmode': 'array',
+                'tickvals': [0, 20, 40, 60, 80, 100],
+                'ticktext': ['0', '20', '40', '60', '80', '100'],
+                'tickwidth': 0,
+                'tickcolor': NEUTRAL_GREY,
+            },
+            'bar': {'color': color, 'thickness': 0.85},
+            'bgcolor': 'rgba(149, 165, 166, 0.2)',
+            'borderwidth': 0,
+            'steps': [{'range': [0, 100], 'color': 'rgba(149, 165, 166, 0.15)'}],
+        },
+    ))
+    fig.update_layout(
+        height=190,
+        margin=dict(l=40, r=70, t=20, b=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+    )
+    return fig
+
+
+def format_limit_line(label, value, italic_fragment=None):
+    """Detail row with muted label and bold dollar value."""
+    if italic_fragment and italic_fragment in label:
+        label_html = label.replace(
+            italic_fragment, f"<i>{italic_fragment}</i>", 1
+        )
+    else:
+        label_html = label
+    return (
+        f"<span class='limit-label'>{label_html}</span> "
+        f"<span class='limit-value'>${value:,.0f}</span>"
+    )
+
+
+def render_account_details(acct):
+    """Centered summary lines below each gauge card."""
+    if acct['label'] == 'FHSA':
+        title_label = "Total Remaining Room"
+    else:
+        title_label = "Remaining Room"
+
+    has_ytd = acct.get('ytd_used') is not None and acct.get('annual_limit') is not None
+    line_style = "text-align:center;margin:6px 0;min-height:1.75rem;line-height:1.75rem"
+    title_html = (
+        f"<span class='limit-value limit-card-title-value'>${acct['remaining']:,.0f}</span> "
+        f"<span class='limit-label limit-card-title-label'>{title_label}</span>"
+    )
+
+    if has_ytd:
+        ytd_rem = max(acct['annual_limit'] - acct['ytd_used'], 0.0)
+        stats_lines = (
+            f"<p style='{line_style}'>{format_limit_line('Remaining Room this Year:', ytd_rem, italic_fragment='this Year')}</p>"
+            f"<p style='{line_style}'>{format_limit_line('Lifetime Limit:', acct['limit'])}</p>"
+            f"<p style='{line_style}'>{format_limit_line('Total Contributions:', acct['used'])}</p>"
+        )
+    else:
+        stats_lines = (
+            f"<p style='{line_style}' class='limit-card-stats-spacer' aria-hidden='true'>&nbsp;</p>"
+            f"<p style='{line_style}'>{format_limit_line('Contribution Limit:', acct['limit'])}</p>"
+            f"<p style='{line_style}'>{format_limit_line('Total Contributions:', acct['used'])}</p>"
+        )
+
+    st.markdown(
+        f"<p class='limit-card-title' style='text-align:center;width:100%;display:flex;"
+        f"justify-content:center;align-items:center;flex-wrap:wrap;gap:0.35rem;margin:0 0 12px 0'>"
+        f"{title_html}</p>"
+        f"<div class='limit-card-stats'>{stats_lines}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_contribution_limits_section(accounts):
+    """Card-based gauge layout for registered contribution room."""
+    for acct in accounts:
+        acct['remaining'] = max(acct['limit'] - acct['used'], 0.0)
+        acct['pct'] = contribution_pct(acct['used'], acct['limit'])
+        acct['full_name'] = ACCOUNT_FULL_NAMES.get(acct['label'], acct['label'])
+
+    st.markdown(
+        """
+        <style>
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] {
+            display: flex !important;
+            align-items: stretch !important;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+            display: flex !important;
+            flex-direction: column !important;
+            align-self: stretch !important;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] > div[data-testid="column"] > div {
+            flex: 1 1 auto !important;
+            display: flex !important;
+            flex-direction: column !important;
+            height: 100% !important;
+            width: 100%;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] [data-testid="stVerticalBlockBorderWrapper"] {
+            flex: 1 1 auto !important;
+            display: flex !important;
+            flex-direction: column !important;
+            height: 100% !important;
+            min-height: 540px;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] [data-testid="stVerticalBlockBorderWrapper"] > div {
+            flex: 1 1 auto;
+            display: flex;
+            flex-direction: column;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] [data-testid="stPlotlyChart"] {
+            margin-bottom: -1.25rem;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] [data-testid="stVerticalBlockBorderWrapper"] [data-testid="stMarkdownContainer"] {
+            text-align: center !important;
+            width: 100%;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-card-header {
+            min-height: 4rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center !important;
+            margin-bottom: 4px;
+            width: 100%;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-card-title {
+            text-align: center !important;
+            margin: 0 0 12px 0;
+            min-height: 3.5rem;
+            display: flex !important;
+            align-items: center;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            font-size: 1.05rem;
+            width: 100%;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-label {
+            color: #7F8C8D;
+            font-weight: 400;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-value {
+            color: inherit;
+            font-weight: 700;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-card-title-value {
+            font-size: 1.15rem;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-card-stats {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            min-height: 8.75rem;
+            flex: 1 1 auto;
+        }
+        #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-card-stats-spacer {
+            visibility: hidden;
+        }
+        @media (prefers-color-scheme: dark) {
+            #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-label {
+                color: rgba(255, 255, 255, 0.45);
+            }
+            #limit-cards-anchor + div[data-testid="stHorizontalBlock"] .limit-value {
+                color: #ffffff;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown('<span id="limit-cards-anchor"></span>', unsafe_allow_html=True)
+
+    cols = st.columns(len(accounts))
+    for col, acct in zip(cols, accounts):
+        with col:
+            with st.container(border=True):
+                st.markdown(
+                    f"<div class='limit-card-header' style='text-align:center;width:100%;"
+                    f"display:flex;align-items:center;justify-content:center'>"
+                    f"<b>{acct['label']}</b> — {acct['full_name']}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(
+                    render_account_gauge(acct['pct']),
+                    use_container_width=True,
+                    key=f"gauge_{acct['label']}",
+                )
+                render_account_details(acct)
+
+                if acct['used'] > acct['limit']:
+                    st.error(f"Over limit by ${acct['used'] - acct['limit']:,.0f}")
+                elif acct['pct'] >= 90:
+                    st.warning(f"Approaching limit ({acct['pct']:.0f}% used)")
+
 # --- 3. VISUALIZATION ENGINE ---
 
-def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
+def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, contribution_limits):
     if df.empty:
         st.warning("No data available to render.")
         return
@@ -210,12 +658,13 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
     
     # --- BENCHMARK CALCULATION ---
     bench_data_raw = get_benchmark_data(bench_info['ticker'], df_total['Date'].min())
-    
+    if not bench_data_raw:
+        bench_data_raw = FALLBACK_BENCH_MAP
+
     bench_units = 0
     bench_values = []
-    # Get first available price or default
-    first_date_match = next(iter(bench_data_raw))
-    first_price_raw = bench_data_raw.get(first_date_match, 100.0)
+    first_date_match = next(iter(bench_data_raw), None)
+    first_price_raw = bench_data_raw.get(first_date_match, 100.0) if first_date_match else 100.0
     
     df_total['Incr_Invest'] = df_total['BookCost'].diff().fillna(df_total['BookCost'].iloc[0])
     
@@ -241,11 +690,30 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
     # --- TAB 1: HISTORY ---
     with tab1:
         # 1. Metric Row
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric(f"Net Worth ({target_currency})", f"${latest['Value']:,.2f}")
-        c2.metric("Total Invested", f"${latest['BookCost']:,.2f}")
-        c3.metric("My ROI", f"{u_roi:.2f}%")
-        c4.metric(f"{bench_key} ROI", f"{b_roi:.2f}%", delta=f"{(u_roi - b_roi):.2f}% vs Market")
+        gain_dollar = latest['Value'] - latest['BookCost']
+        gain_pct = u_roi
+        gain_color = PRIMARY_GREEN if gain_dollar >= 0 else DANGER_RED
+        if gain_dollar >= 0:
+            gain_line = f"+${gain_dollar:,.2f} (+{gain_pct:.2f}%)"
+        else:
+            gain_line = f"-${abs(gain_dollar):,.2f} ({gain_pct:.2f}%)"
+        st.markdown(
+            f'<p style="color:#7F8C8D;font-size:0.95rem;margin:0 0 0.35rem 0">'
+            f'Net Worth ({target_currency})</p>'
+            f'<p style="font-size:2.75rem;font-weight:700;margin:0;line-height:1.1">'
+            f'${latest["Value"]:,.2f}</p>'
+            f'<p style="color:{gain_color};font-size:1.1rem;font-weight:600;'
+            f'margin:0.35rem 0 1.25rem 0">{gain_line}</p>',
+            unsafe_allow_html=True,
+        )
+        monthly_contrib = (
+            df_total['BookCost'].diff().dropna().mean()
+            if len(df_total) >= 2 else 0.0
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Invested", f"${latest['BookCost']:,.2f}")
+        c2.metric("Monthly Contribution (avg)", f"${monthly_contrib:,.2f}")
+        c3.metric(f"{bench_key} ROI", f"{b_roi:.2f}%", delta=f"{(u_roi - b_roi):.2f}% vs Market")
 
         st.markdown("---")
 
@@ -265,7 +733,7 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
             hovertemplate='Value: $%{y:,.2f}'
         ))
         fig_net.update_layout(
-            hovermode="x unified", template="plotly_white", height=400, 
+            hovermode="x unified", template=PLOTLY_TEMPLATE, height=400, 
             yaxis_tickprefix="$", yaxis_tickformat=",.2f"
         )
         st.plotly_chart(fig_net, use_container_width=True)
@@ -288,7 +756,7 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
             hovertemplate='My Portfolio: $%{y:,.2f}'
         ))
         fig_bench.update_layout(
-            hovermode="x unified", template="plotly_white", height=400, 
+            hovermode="x unified", template=PLOTLY_TEMPLATE, height=400, 
             yaxis_tickprefix="$", yaxis_tickformat=",.2f"
         )
         st.plotly_chart(fig_bench, use_container_width=True)
@@ -299,12 +767,12 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
         with col_a:
             st.subheader("Portfolio Composition")
             fig_comp = px.area(
-                df_conv.groupby(['Date', 'Type'])['Value'].sum().reset_index(), 
-                x="Date", y="Value", color="Type", 
+                df_conv.groupby(['Date', 'Type'])['Value'].sum().reset_index(),
+                x="Date", y="Value", color="Type",
                 color_discrete_map=color_map
             )
             fig_comp.update_layout(
-                hovermode="x unified", template="plotly_white", 
+                hovermode="x unified", template=PLOTLY_TEMPLATE, 
                 yaxis_tickprefix="$", yaxis_tickformat=",.2f"
             )
             fig_comp.update_traces(hovertemplate='$%{y:,.2f}')
@@ -323,15 +791,16 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
                 hovertemplate='Gain: $%{y:,.2f}<extra></extra>'
             ))
             fig_bar.update_layout(
-                template="plotly_white", 
+                template=PLOTLY_TEMPLATE, 
                 yaxis_tickprefix="$", yaxis_tickformat=",.2f"
             )
             st.plotly_chart(fig_bar, use_container_width=True)
             
         # 5. Chart: Allocation Donut
         st.subheader("Current Allocation")
+        latest_date = df_conv['Date'].max()
         fig_pie = px.pie(
-            df[df['Date'] == latest['Date']].groupby('Type')['Value'].sum().reset_index(),
+            df_conv[df_conv['Date'] == latest_date].groupby('Type')['Value'].sum().reset_index(),
             values='Value', names='Type', hole=0.5,
             color='Type', color_discrete_map=color_map
         )
@@ -347,6 +816,29 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
         )
         
         st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.markdown("---")
+
+        # 6. Registered Contribution Limits
+        st.subheader("Registered Contribution Limits")
+        st.caption(
+            "These figures are estimates based on Book Cost, a proxy for contributed capital. "
+            "Withdrawals, in-kind transfers, or cost-base adjustments may differ from CRA records."
+        )
+
+        tfsa_used = get_contribution_usage(df, 'TFSA')
+        fhsa_used = get_contribution_usage(df, 'FHSA')
+        rrsp_used = get_contribution_usage(df, 'RRSP')
+        fhsa_ytd = get_ytd_contribution(df, 'FHSA')
+
+        render_contribution_limits_section([
+            {'label': 'TFSA', 'used': tfsa_used, 'limit': contribution_limits['tfsa']},
+            {
+                'label': 'FHSA', 'used': fhsa_used, 'limit': contribution_limits['fhsa'],
+                'ytd_used': fhsa_ytd, 'annual_limit': FHSA_ANNUAL_LIMIT,
+            },
+            {'label': 'RRSP', 'used': rrsp_used, 'limit': contribution_limits['rrsp']},
+        ])
 
         with st.expander("View Raw Data"):
             st.dataframe(df_conv)
@@ -369,6 +861,15 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
             current_nw = latest['Value']
             st.divider()
             st.metric("Starting Capital", f"${current_nw:,.2f}")
+
+            tfsa_monthly = avg_monthly_contribution(df, 'TFSA')
+            fhsa_monthly = avg_monthly_contribution(df, 'FHSA')
+            tfsa_room = max(contribution_limits['tfsa'] - get_contribution_usage(df, 'TFSA'), 0)
+            fhsa_room = max(contribution_limits['fhsa'] - get_contribution_usage(df, 'FHSA'), 0)
+            if tfsa_monthly > 0 and tfsa_room > 0:
+                st.caption(f"TFSA room fills in ~{tfsa_room / tfsa_monthly:.0f} mo at ${tfsa_monthly:,.0f}/mo avg")
+            if fhsa_monthly > 0 and fhsa_room > 0:
+                st.caption(f"FHSA room fills in ~{fhsa_room / fhsa_monthly:.0f} mo at ${fhsa_monthly:,.0f}/mo avg")
         
         # Run Simulation
         paths = run_monte_carlo(current_nw, sim_contrib, sim_years, sim_return, sim_vol)
@@ -399,7 +900,7 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate):
             final_median = p50[-1]
             fig_mc.update_layout(
                 title=f"Projected Median (In {sim_years} Years): ${final_median:,.2f}", 
-                template="plotly_white", hovermode="x unified", yaxis_tickprefix="$"
+                template=PLOTLY_TEMPLATE, hovermode="x unified", yaxis_tickprefix="$"
             )
             st.plotly_chart(fig_mc, use_container_width=True)
 
@@ -410,6 +911,12 @@ if 'demo_active' not in st.session_state:
     st.session_state.demo_active = False
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
+if 'contribution_limits' not in st.session_state:
+    st.session_state.contribution_limits = {
+        'tfsa': TFSA_CONTRIBUTION_LIMIT,
+        'fhsa': FHSA_CONTRIBUTION_LIMIT,
+        'rrsp': RRSP_CONTRIBUTION_LIMIT,
+    }
 
 st.title("🥞Stacked: Investment Dashboard")
 
@@ -434,31 +941,58 @@ with st.sidebar:
 
     if uploaded_files:
         st.session_state.demo_active = False
+        render_import_feedback(parse_data(uploaded_files))
 
     with st.expander("Template CSV"):
-        template = "Date,Bank,Fund Name,Book Cost,Market Value\n01/31/2023,Questrade,TFSA S&P 500,$1000.00,$1050.00\n01/31/2023,Wealthsimple,RESP Education,$500.00,$505.00"
+        st.caption(
+            "Download a 12-month sample. Use TFSA, FHSA, RRSP, RESP, or Non-Registered as the fund name."
+        )
+        template = TEMPLATE_CSV_PATH.read_text(encoding="utf-8")
         st.download_button("Download Template", template, "stacked_template.csv", "text/csv")
-        
+
     st.markdown("---")
 
     # 2. Settings
     st.header("2. Settings")
-    
+
     # Currency Toggle
     target_currency = st.radio("Display Currency", ["CAD", "USD"], horizontal=True)
     st.caption(f"Live Rate: 1 USD = {usd_cad_rate:.2f} CAD")
-    
+
     # Benchmark Selector
     bench_choice = st.selectbox("Compare Against:", list(BENCHMARK_CONTEXT.keys()))
     st.caption(BENCHMARK_CONTEXT[bench_choice]['desc'])
+
+    st.markdown("---")
+
+    # 3. Contribution Room
+    st.header("3. Contribution Room (CAD)")
+    limits = st.session_state.contribution_limits
+    contribution_limits = {
+        'tfsa': st.number_input(
+            "TFSA Lifetime Room", value=limits['tfsa'], step=500, min_value=0,
+        ),
+        'fhsa': st.number_input(
+            "FHSA Lifetime Room", value=limits['fhsa'], step=500, min_value=0,
+        ),
+        'rrsp': st.number_input(
+            "RRSP Room", value=limits['rrsp'], step=500, min_value=0,
+        ),
+    }
+    st.session_state.contribution_limits = contribution_limits
+    cra_col, info_col = st.columns([8, 1])
+    with cra_col:
+        st.link_button("CRA My Account", CRA_MY_ACCOUNT_URL, use_container_width=True)
+    with info_col:
+        render_cra_info_tooltip()
 
 
 # Logic to Switch Data Source
 if st.session_state.demo_active:
     df_to_show = generate_example_data()
-    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate)
+    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate, contribution_limits)
 elif uploaded_files:
     df_to_show = parse_data(uploaded_files)
-    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate)
+    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate, contribution_limits)
 else:
     st.info("Upload your CSV files to begin, or click 'Load Demo' in the sidebar.")
