@@ -886,15 +886,15 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
             fig_mc = go.Figure()
             # 90th Percentile (Optimistic)
             fig_mc.add_trace(go.Scatter(
-                x=future_dates, y=p90, mode='lines', line=dict(color=BENCHMARK_ORANGE,width=3), name='Upper Bound (90%)', hovertemplate="$%{y:,.0f}"
+                x=future_dates, y=p90, mode='lines', line=dict(color=BENCHMARK_ORANGE,width=3), name='Upper Bound (90%)', legendrank=1, hovertemplate="$%{y:,.0f}"
             ))
             # 10th Percentile (Pessimistic) - Fill area
             fig_mc.add_trace(go.Scatter(
-                x=future_dates, y=p10, mode='lines', line=dict(color= DANGER_RED, width=3), fill='tonexty', fillcolor='rgba(46, 204, 113, 0.2)', name='Lower Bound (10%)', hovertemplate="$%{y:,.0f}"
+                x=future_dates, y=p10, mode='lines', line=dict(color= DANGER_RED, width=3), fill='tonexty', fillcolor='rgba(46, 204, 113, 0.2)', name='Lower Bound (10%)', legendrank=3, hovertemplate="$%{y:,.0f}"
             ))
             # Median
             fig_mc.add_trace(go.Scatter(
-                x=future_dates, y=p50, mode='lines', line=dict(color=PRIMARY_GREEN, width=3), name='Median Outcome' , hovertemplate="$%{y:,.0f}"
+                x=future_dates, y=p50, mode='lines', line=dict(color=PRIMARY_GREEN, width=3), name='Median Outcome', legendrank=2, hovertemplate="$%{y:,.0f}"
             ))
             
             final_median = p50[-1]
