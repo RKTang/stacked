@@ -76,6 +76,28 @@ def get_benchmark_data(ticker_symbol, start_date):
     except Exception:
         return FALLBACK_BENCH_MAP
 
+
+def classify_account(fund_name, bank_name=""):
+    exact = str(fund_name).strip().lower()
+    simple_types = {
+        'tfsa': 'TFSA',
+        'fhsa': 'FHSA',
+        'rrsp': 'RRSP',
+        'resp': 'RESP',
+        'non-registered': 'Non-Registered',
+    }
+    if exact in simple_types:
+        return simple_types[exact]
+
+    text = (str(fund_name) + " " + str(bank_name)).lower()
+    if any(k in text for k in ['first home', 'fhsa']): return 'FHSA'
+    if any(k in text for k in ['education', 'resp']): return 'RESP'
+    if any(k in text for k in ['tax free', 'tfsa', 'tax-free']): return 'TFSA'
+    if any(k in text for k in ['rrsp', 'retirement', 'rsp', 'lira', 'locked-in']): return 'RRSP'
+    if any(k in text for k in ['unregistered', 'margin', 'cash', 'individual', 'joint', 'taxable']): return 'Non-Registered'
+    return 'Non-Registered'
+
+
 @st.cache_data
 def parse_data(uploaded_files):
     all_data = []
@@ -87,34 +109,52 @@ def parse_data(uploaded_files):
         try: return float(s)
         except ValueError: return 0.0
 
-    def classify_account(fund_name, bank_name):
-        exact = str(fund_name).strip().lower()
-        simple_types = {
-            'tfsa': 'TFSA',
-            'fhsa': 'FHSA',
-            'rrsp': 'RRSP',
-            'resp': 'RESP',
-            'non-registered': 'Non-Registered',
-        }
-        if exact in simple_types:
-            return simple_types[exact]
-
-        text = (str(fund_name) + " " + str(bank_name)).lower()
-        if any(k in text for k in ['first home', 'fhsa']): return 'FHSA'
-        if any(k in text for k in ['education', 'resp']): return 'RESP'
-        if any(k in text for k in ['tax free', 'tfsa', 'tax-free']): return 'TFSA'
-        if any(k in text for k in ['rrsp', 'retirement', 'rsp', 'lira', 'locked-in']): return 'RRSP'
-        if any(k in text for k in ['unregistered', 'margin', 'cash', 'individual', 'joint', 'taxable']): return 'Non-Registered'
-        return 'Non-Registered'
-
     for uploaded_file in uploaded_files:
         try:
             stringio = uploaded_file.getvalue().decode("utf-8", errors='ignore')
             reader = csv.reader(stringio.splitlines())
             rows = list(reader)
             current_date = None
+            ticker_template_columns = None
             for row in rows:
                 if not row: continue
+                normalized_headers = {
+                    re.sub(r'[^a-z0-9]+', '', cell.strip().lower()): i
+                    for i, cell in enumerate(row)
+                }
+                required_headers = {'date', 'account', 'ticker', 'bookcost', 'marketvalue'}
+                if required_headers.issubset(normalized_headers):
+                    ticker_template_columns = normalized_headers
+                    continue
+
+                if ticker_template_columns:
+                    if len(row) < max(ticker_template_columns.values()) + 1:
+                        continue
+                    date_text = row[ticker_template_columns['date']].strip()
+                    if date_text:
+                        try:
+                            current_date = pd.to_datetime(date_text)
+                        except (ValueError, TypeError):
+                            continue
+                    if current_date is None:
+                        continue
+
+                    account_name = row[ticker_template_columns['account']].strip()
+                    ticker = row[ticker_template_columns['ticker']].strip().upper()
+                    market_value = clean_money(row[ticker_template_columns['marketvalue']])
+                    book_cost = clean_money(row[ticker_template_columns['bookcost']])
+                    if account_name and ticker and market_value > 0:
+                        all_data.append({
+                            'Date': current_date,
+                            'Type': classify_account(account_name, ""),
+                            'Bank': "",
+                            'FundName': ticker,
+                            'Ticker': ticker,
+                            'Value': market_value,
+                            'BookCost': book_cost,
+                        })
+                    continue
+
                 if len(row) > 0 and re.match(r'^\d{1,2}/\d{1,2}/\d{4}', row[0]):
                     try: current_date = pd.to_datetime(row[0])
                     except: pass
@@ -149,6 +189,7 @@ def parse_data(uploaded_files):
                         all_data.append({
                             'Date': current_date, 'Type': acct_type,
                             'Bank': bank_name, 'FundName': fund_name,
+                            'Ticker': '',
                             'Value': market_value, 'BookCost': book_cost
                         })
         except Exception as e:
@@ -156,15 +197,134 @@ def parse_data(uploaded_files):
 
     return pd.DataFrame(all_data).sort_values('Date') if all_data else pd.DataFrame()
 
+
+@st.cache_data
+def get_current_ticker_price(symbol, currency):
+    """Fetch the latest market price, preferring the Canadian listing for CAD assets."""
+    candidates = [symbol]
+    if currency == 'CAD' and '.' not in symbol:
+        candidates = [f"{symbol}.TO", f"{symbol}.NE", symbol]
+
+    errors = []
+    for candidate in candidates:
+        try:
+            history = yf.Ticker(candidate).history(period="5d", auto_adjust=False)
+            if not history.empty and 'Close' in history:
+                prices = history['Close'].dropna()
+                if not prices.empty:
+                    return float(prices.iloc[-1]), candidate
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    detail = "; ".join(errors) if errors else "No recent closing price was returned."
+    return None, detail
+
+
+@st.cache_data
+def parse_wealthsimple_export(uploaded_files, usd_cad_rate):
+    """Reconstruct current ticker positions from Wealthsimple BUY/SELL activities."""
+    trades = []
+    warnings = []
+    required_columns = {
+        'effective_date', 'account_id', 'account_type', 'activity_type',
+        'activity_sub_type', 'symbol', 'currency', 'quantity',
+    }
+
+    for uploaded_file in uploaded_files:
+        try:
+            content = uploaded_file.getvalue().decode("utf-8-sig", errors='replace')
+            reader = csv.DictReader(content.splitlines())
+            headers = {
+                str(header).strip().lower()
+                for header in (reader.fieldnames or [])
+                if header is not None
+            }
+            if not required_columns.issubset(headers):
+                continue
+
+            for row in reader:
+                if (
+                    str(row.get('activity_type', '')).strip().lower() != 'trade'
+                    or str(row.get('activity_sub_type', '')).strip().upper() not in {'BUY', 'SELL'}
+                ):
+                    continue
+
+                symbol = str(row.get('symbol', '')).strip().upper()
+                try:
+                    quantity = abs(float(row.get('quantity', '')))
+                except (TypeError, ValueError):
+                    warnings.append("Skipped a Wealthsimple trade with an invalid quantity.")
+                    continue
+                if not symbol or quantity == 0:
+                    warnings.append("Skipped a Wealthsimple trade without a ticker or quantity.")
+                    continue
+
+                trade = dict(row)
+                trade['symbol'] = symbol
+                trade['quantity'] = quantity if row['activity_sub_type'].strip().upper() == 'BUY' else -quantity
+                trade['currency'] = str(row.get('currency', 'CAD')).strip().upper() or 'CAD'
+                if trade['currency'] not in {'CAD', 'USD'}:
+                    warnings.append(
+                        f"{symbol}: skipped a trade in unsupported currency "
+                        f"{trade['currency']}."
+                    )
+                    continue
+                trades.append(trade)
+        except Exception as exc:
+            warnings.append(f"Could not read {uploaded_file.name} as a Wealthsimple export: {exc}")
+
+    if not trades:
+        return pd.DataFrame(), warnings
+
+    trade_df = pd.DataFrame(trades)
+    trade_df['effective_date'] = pd.to_datetime(trade_df['effective_date'], errors='coerce')
+    trade_df = trade_df.dropna(subset=['effective_date'])
+    trade_df = trade_df.sort_values(['effective_date', 'effective_time'], kind='stable')
+
+    position_columns = ['account_id', 'account_type', 'symbol']
+    holdings = []
+    for (account_id, account_type, symbol), group in trade_df.groupby(
+        position_columns, dropna=False, sort=False
+    ):
+        quantity = group['quantity'].sum()
+        if abs(quantity) < 1e-8:
+            continue
+        if quantity < 0:
+            warnings.append(
+                f"{symbol}: reconstructed position is negative; check for trades "
+                "before the export period or other position changes."
+            )
+            continue
+
+        currency = group['currency'].iloc[-1]
+        price, quote_source = get_current_ticker_price(symbol, currency)
+        if price is None:
+            warnings.append(f"{symbol}: could not fetch a current quote ({quote_source}).")
+            continue
+
+        value_cad = quantity * price * (usd_cad_rate if currency == 'USD' else 1.0)
+        holdings.append({
+            'Type': classify_account(account_type),
+            'Ticker': symbol,
+            'Quantity': quantity,
+            'Price': price,
+            'Currency': currency,
+            'Quote': quote_source,
+            'Value': value_cad,
+        })
+
+    return pd.DataFrame(holdings), warnings
+
+
 def generate_example_data():
     dates = pd.date_range(start='2021-01-01', periods=len(REAL_SP500_DATA), freq='MS')
     all_records = []
     assets = [
-        {"Type": "TFSA", "Monthly": 400, "Prices": REAL_SP500_DATA},
-        {"Type": "FHSA", "Monthly": 150, "Prices": None, "Base": 100, "Growth": 0.002},
-        {"Type": "RRSP", "Monthly": 300, "Prices": None, "Base": 100, "Growth": 0.003},
-        {"Type": "RESP", "Monthly": 200, "Prices": None, "Base": 100, "Growth": 0.005},
-        {"Type": "Non-Registered", "Monthly": 100, "Prices": None, "Base": 50, "Growth": 0.012, "Vol": 0.08}
+        {"Type": "TFSA", "Ticker": "VEQT", "Monthly": 400, "Prices": REAL_SP500_DATA},
+        {"Type": "FHSA", "Ticker": "CASH.TO", "Monthly": 150, "Prices": None, "Base": 100, "Growth": 0.002},
+        {"Type": "RRSP", "Ticker": "VFV", "Monthly": 300, "Prices": None, "Base": 100, "Growth": 0.003},
+        {"Type": "RESP", "Ticker": "XGRO", "Monthly": 200, "Prices": None, "Base": 100, "Growth": 0.005},
+        {"Type": "Non-Registered", "Ticker": "XEQT", "Monthly": 100, "Prices": None, "Base": 50, "Growth": 0.012, "Vol": 0.08}
     ]
     units = {a["Type"]: 0.0 for a in assets}
     prices = {a["Type"]: a.get("Base", 100) for a in assets}
@@ -184,6 +344,7 @@ def generate_example_data():
                 'Type': acct_type,
                 'Bank': 'Demo',
                 'FundName': acct_type,
+                'Ticker': a["Ticker"],
                 'Value': units[acct_type] * price,
                 'BookCost': (i + 1) * a["Monthly"]
             })
@@ -198,15 +359,18 @@ def validate_import_data(df):
 
     latest = df['Date'].max()
     n_months = df['Date'].nunique()
-    fund_col = 'FundName' if 'FundName' in df.columns else 'Type'
+    has_tickers = 'Ticker' in df.columns and df['Ticker'].fillna('').astype(str).str.strip().ne('').any()
+    fund_col = 'Ticker' if has_tickers else ('FundName' if 'FundName' in df.columns else 'Type')
     latest_funds = df[df['Date'] == latest][fund_col].nunique()
+    item_label = 'holdings' if has_tickers else 'accounts'
     summary = (
         f"Latest snapshot: {latest.strftime('%b %Y')} · "
-        f"{latest_funds} accounts · {n_months} months loaded"
+        f"{latest_funds} {item_label} · {n_months} months loaded"
     )
     warnings = []
 
-    dupes = df.duplicated(subset=['Date', fund_col], keep=False)
+    duplicate_columns = ['Date', 'Type', fund_col] if has_tickers else ['Date', fund_col]
+    dupes = df.duplicated(subset=duplicate_columns, keep=False)
     if dupes.any():
         warnings.append(
             f"Duplicate rows for the same date and fund ({int(dupes.sum())} rows)."
@@ -614,7 +778,7 @@ def render_contribution_limits_section(accounts):
                 )
                 st.plotly_chart(
                     render_account_gauge(acct['pct']),
-                    use_container_width=True,
+                    width="stretch",
                     key=f"gauge_{acct['label']}",
                 )
                 render_account_details(acct)
@@ -626,7 +790,95 @@ def render_contribution_limits_section(accounts):
 
 # --- 3. VISUALIZATION ENGINE ---
 
-def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, contribution_limits):
+
+def render_ticker_allocation(holdings, target_currency, value_scale=1.0):
+    st.subheader("Current Allocation by Ticker")
+    if holdings.empty:
+        st.info(
+            "Upload ticker-level data or a Wealthsimple activities export to see "
+            "your holdings allocation."
+        )
+        return
+
+    ticker_allocation = (
+        holdings.assign(Value=holdings['Value'] * value_scale)
+        .groupby('Ticker', as_index=False)['Value']
+        .sum()
+        .sort_values('Value', ascending=False)
+    )
+    ticker_allocation = ticker_allocation[ticker_allocation['Value'] > 0]
+    if ticker_allocation.empty:
+        st.info("No positive ticker positions are available to chart.")
+        return
+
+    total_value = ticker_allocation['Value'].sum()
+    ticker_allocation['Weight'] = ticker_allocation['Value'] / total_value
+    fig_ticker = px.pie(
+        ticker_allocation,
+        values='Value',
+        names='Ticker',
+        hole=0.5,
+    )
+    fig_ticker.update_traces(
+        textfont_color='white',
+        textinfo='percent+label',
+        insidetextorientation='horizontal',
+        hovertemplate='%{label}<br>$%{value:,.2f}<br>%{percent}',
+    )
+    fig_ticker.update_layout(
+        annotations=[dict(
+            text=f"${total_value:,.2f}",
+            x=0.5,
+            y=0.5,
+            font_size=20,
+            showarrow=False,
+        )]
+    )
+    st.plotly_chart(fig_ticker, width="stretch")
+
+    if {'Quantity', 'Price', 'Currency'}.issubset(holdings.columns):
+        details = holdings.copy()
+        details['Value'] = details['Value'] * value_scale
+        details = details.groupby(['Ticker', 'Currency'], as_index=False).agg({
+            'Quantity': 'sum',
+            'Price': 'last',
+            'Value': 'sum',
+        })
+        details['Weight'] = details['Value'] / total_value
+        details = details.rename(columns={
+            'Value': f'Market Value ({target_currency})',
+            'Weight': 'Portfolio Weight',
+        })
+        st.dataframe(
+            details,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                'Price': st.column_config.NumberColumn(
+                    format="dollar"
+                ),
+                f'Market Value ({target_currency})': st.column_config.NumberColumn(
+                    format="dollar"
+                ),
+                'Portfolio Weight': st.column_config.NumberColumn(
+                    format="percent"
+                ),
+            },
+        )
+    else:
+        ticker_allocation['Value'] = ticker_allocation['Value'].map(
+            lambda value: f"${value:,.2f}"
+        )
+        ticker_allocation['Weight'] = ticker_allocation['Weight'].map(
+            lambda weight: f"{weight:.1%}"
+        )
+        st.dataframe(ticker_allocation, hide_index=True, width="stretch")
+
+
+def render_dashboard(
+    df, bench_key, bench_info, target_currency, usd_cad_rate,
+    contribution_limits, wealthsimple_holdings=None,
+):
     if df.empty:
         st.warning("No data available to render.")
         return
@@ -736,7 +988,7 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
             hovermode="x unified", template=PLOTLY_TEMPLATE, height=400, 
             yaxis_tickprefix="$", yaxis_tickformat=",.2f"
         )
-        st.plotly_chart(fig_net, use_container_width=True)
+        st.plotly_chart(fig_net, width="stretch")
 
         # 3. Chart: Benchmark Comparison
         st.subheader(f"Portfolio vs. {bench_key}")
@@ -759,7 +1011,7 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
             hovermode="x unified", template=PLOTLY_TEMPLATE, height=400, 
             yaxis_tickprefix="$", yaxis_tickformat=",.2f"
         )
-        st.plotly_chart(fig_bench, use_container_width=True)
+        st.plotly_chart(fig_bench, width="stretch")
 
         # 4. Charts: Composition & Returns
         col_a, col_b = st.columns(2)
@@ -776,7 +1028,7 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
                 yaxis_tickprefix="$", yaxis_tickformat=",.2f"
             )
             fig_comp.update_traces(hovertemplate='$%{y:,.2f}')
-            st.plotly_chart(fig_comp, use_container_width=True)
+            st.plotly_chart(fig_comp, width="stretch")
 
         with col_b:
             st.subheader("Monthly Market Gain ($)")
@@ -794,10 +1046,10 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
                 template=PLOTLY_TEMPLATE, 
                 yaxis_tickprefix="$", yaxis_tickformat=",.2f"
             )
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width="stretch")
             
-        # 5. Chart: Allocation Donut
-        st.subheader("Current Allocation")
+        # 5. Allocation charts
+        st.subheader("Current Allocation by Account Type")
         latest_date = df_conv['Date'].max()
         fig_pie = px.pie(
             df_conv[df_conv['Date'] == latest_date].groupby('Type')['Value'].sum().reset_index(),
@@ -815,7 +1067,28 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
             annotations=[dict(text=f"${latest['Value']:,.2f}", x=0.5, y=0.5, font_size=20, showarrow=False)]
         )
         
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width="stretch")
+
+        if wealthsimple_holdings is not None and not wealthsimple_holdings.empty:
+            render_ticker_allocation(
+                wealthsimple_holdings,
+                target_currency,
+                value_scale=user_fx_multiplier,
+            )
+            st.caption(
+                "Positions are reconstructed from BUY/SELL trades in the uploaded "
+                "Wealthsimple export and valued using recent market quotes. "
+                "Holdings from before the export period or non-trade position "
+                "changes may be missing."
+            )
+        else:
+            latest_holdings = pd.DataFrame()
+            if 'Ticker' in df_conv.columns:
+                latest_holdings = df_conv[
+                    (df_conv['Date'] == latest_date)
+                    & df_conv['Ticker'].fillna('').astype(str).str.strip().ne('')
+                ]
+            render_ticker_allocation(latest_holdings, target_currency)
 
         st.markdown("---")
 
@@ -857,6 +1130,18 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
             sim_contrib = st.number_input(f"Monthly Contribution ({target_currency})", value=2000, step=100)
             sim_return = st.slider("Exp. Annual Return (%)", 0.0, 50.0, 7.0) / 100
             sim_vol = st.slider("Volatility (%)", 5.0, 30.0, 15.0) / 100
+            annual_spending = st.number_input(
+                f"Annual Retirement Spending ({target_currency}, today's value)",
+                min_value=1,
+                value=60000,
+                step=1000,
+            )
+            withdrawal_rate = st.slider(
+                "Withdrawal Rate (%)", 2.0, 8.0, 4.0, step=0.25
+            ) / 100
+            inflation_rate = st.slider(
+                "Expected Inflation (%)", 0.0, 10.0, 2.5, step=0.25
+            ) / 100
             
             current_nw = latest['Value']
             st.divider()
@@ -880,6 +1165,17 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
         p90 = np.percentile(paths, 90, axis=1)
         
         future_dates = pd.date_range(start=latest['Date'], periods=len(p50), freq='ME')
+        fire_number = annual_spending / withdrawal_rate
+        fire_target_path = fire_number * np.power(
+            1 + inflation_rate, np.arange(len(future_dates)) / 12
+        )
+        reached_goal = paths >= fire_target_path[:, np.newaxis]
+        reached_scenarios = reached_goal.any(axis=0)
+        probability_reaching_fire = reached_scenarios.mean() * 100
+        median_years_to_fire = None
+        if reached_scenarios.any():
+            first_reach_month = reached_goal[:, reached_scenarios].argmax(axis=0)
+            median_years_to_fire = np.median(first_reach_month) / 12
         
         # Plotting
         with col_chart:
@@ -896,13 +1192,37 @@ def render_dashboard(df, bench_key, bench_info, target_currency, usd_cad_rate, c
             fig_mc.add_trace(go.Scatter(
                 x=future_dates, y=p50, mode='lines', line=dict(color=PRIMARY_GREEN, width=3), name='Median Outcome', legendrank=2, hovertemplate="$%{y:,.0f}"
             ))
+            # FIRE target, adjusted for inflation over the projection period.
+            fig_mc.add_trace(go.Scatter(
+                x=future_dates, y=fire_target_path, mode='lines',
+                line=dict(color='#FFFFFF', width=2, dash='dash'),
+                name='FIRE Target (inflation-adjusted)', legendrank=4,
+                hovertemplate="FIRE target: $%{y:,.0f}<extra></extra>",
+            ))
             
             final_median = p50[-1]
             fig_mc.update_layout(
                 title=f"Projected Median (In {sim_years} Years): ${final_median:,.2f}", 
                 template=PLOTLY_TEMPLATE, hovermode="x unified", yaxis_tickprefix="$"
             )
-            st.plotly_chart(fig_mc, use_container_width=True)
+            st.plotly_chart(fig_mc, width="stretch")
+            fire_cols = st.columns(3)
+            fire_cols[0].metric("FIRE Number (today)", f"${fire_number:,.0f}")
+            fire_cols[1].metric(
+                f"Chance of FIRE in {sim_years} Years",
+                f"{probability_reaching_fire:.0f}%",
+            )
+            fire_cols[2].metric(
+                "Median Time to FIRE (if reached)",
+                f"{median_years_to_fire:.1f} years"
+                if median_years_to_fire is not None else "Not reached",
+            )
+            st.caption(
+                f"FIRE number = annual spending divided by a "
+                f"{withdrawal_rate:.2%} withdrawal rate. The chart target grows "
+                f"with {inflation_rate:.2%} annual inflation. Estimates use "
+                f"500 simulated scenarios and are not guarantees."
+            )
 
 # --- 4. MAIN CONTROLLER ---
 
@@ -926,6 +1246,7 @@ usd_cad_rate = get_exchange_rate()
 with st.sidebar:
     st.header("1. Data Import")
     uploaded_files = st.file_uploader("Upload CSV Files", type="csv", accept_multiple_files=True, key=f"uploader_{st.session_state.uploader_key}")
+    st.caption("Supports monthly portfolio snapshots and Wealthsimple activity exports.")
     
     col_demo, col_clear = st.columns(2)
     with col_demo:
@@ -945,7 +1266,8 @@ with st.sidebar:
 
     with st.expander("Template CSV"):
         st.caption(
-            "Download a 12-month sample. Use TFSA, FHSA, RRSP, RESP, or Non-Registered as the fund name."
+            "Download a sample with one row per ticker per account and month. "
+            "Enter each holding's book cost and market value in CAD."
         )
         template = TEMPLATE_CSV_PATH.read_text(encoding="utf-8")
         st.download_button("Download Template", template, "stacked_template.csv", "text/csv")
@@ -982,7 +1304,7 @@ with st.sidebar:
     st.session_state.contribution_limits = contribution_limits
     cra_col, info_col = st.columns([8, 1])
     with cra_col:
-        st.link_button("CRA My Account", CRA_MY_ACCOUNT_URL, use_container_width=True)
+        st.link_button("CRA My Account", CRA_MY_ACCOUNT_URL, width="stretch")
     with info_col:
         render_cra_info_tooltip()
 
@@ -993,6 +1315,46 @@ if st.session_state.demo_active:
     render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate, contribution_limits)
 elif uploaded_files:
     df_to_show = parse_data(uploaded_files)
-    render_dashboard(df_to_show, bench_choice, BENCHMARK_CONTEXT[bench_choice], target_currency, usd_cad_rate, contribution_limits)
+    wealthsimple_holdings, import_warnings = parse_wealthsimple_export(
+        uploaded_files, usd_cad_rate
+    )
+    for warning in import_warnings:
+        st.warning(warning)
+
+    if not df_to_show.empty:
+        render_dashboard(
+            df_to_show,
+            bench_choice,
+            BENCHMARK_CONTEXT[bench_choice],
+            target_currency,
+            usd_cad_rate,
+            contribution_limits,
+            wealthsimple_holdings=wealthsimple_holdings,
+        )
+    elif not wealthsimple_holdings.empty:
+        st.info(
+            "Wealthsimple activity exports provide trades rather than monthly "
+            "portfolio snapshots. Ticker allocation is available below; upload "
+            "monthly snapshots to see historical performance and the simulator."
+        )
+        user_fx_multiplier = (
+            1.0 / usd_cad_rate if target_currency == "USD" else 1.0
+        )
+        render_ticker_allocation(
+            wealthsimple_holdings,
+            target_currency,
+            value_scale=user_fx_multiplier,
+        )
+        st.caption(
+            "Positions are reconstructed from BUY/SELL trades in the uploaded "
+            "history and valued using recent market quotes. Holdings from before "
+            "the export period or non-trade position changes may be missing."
+        )
+    else:
+        st.error(
+            "No monthly portfolio data or priceable Wealthsimple BUY/SELL "
+            "positions were found in the uploaded CSV files. Check the warnings "
+            "above for unsupported trades or missing market quotes."
+        )
 else:
     st.info("Upload your CSV files to begin, or click 'Load Demo' in the sidebar.")
